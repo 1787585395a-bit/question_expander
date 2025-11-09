@@ -1,0 +1,324 @@
+import os
+import shutil
+import time
+import random
+import json
+from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+import requests
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from tqdm import tqdm
+
+# ---------- 配置（请根据需要修改） ----------
+INPUT_EXCEL = r"C:\Users\Administrator\Desktop\问题识别脚本\questions.xlsx"
+# 输出为 INPUT_EXCEL_new.xlsx（你也可以直接设为其他路径）
+QUESTION_NEW = INPUT_EXCEL.replace(".xlsx", "_new.xlsx")
+
+EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+MOONSHOT_API_URL = "https://api.moonshot.cn/v1/chat/completions"  # 如需换API请改此处
+API_KEY = ""
+MODEL_NAME = "moonshot-v1-8k"
+TEMPERATURE = 0.8
+
+SIMILARITY_THRESHOLD = 0.75  # 判定为 SAME 的向量相似度阈值
+MIN_SIMILAR_PER_CATEGORY = 9  # SAME + STANDARD 目标数量
+MAX_CATEGORY_RETRIES = 3      # 每类最多尝试次数
+API_TIMEOUT = 60              # 请求超时（秒）
+
+# ---------- 复制输入文件为新的excel（保持 A/B 列等原样） ----------
+shutil.copyfile(INPUT_EXCEL, QUESTION_NEW)
+print(f"[文件] 已复制 {INPUT_EXCEL} -> {QUESTION_NEW}")
+
+# ---------- 读取 Excel（以 INPUT_EXCEL 为源数据） ----------
+df = pd.read_excel(INPUT_EXCEL, engine="openpyxl")
+df['question'] = df['question'].astype(str).str.strip()
+df = df[~df['question'].isna()].reset_index(drop=True)
+
+# 新表格（QUESTION_NEW）也读一份并确保存在 label 列和 add 列
+df_new = pd.read_excel(QUESTION_NEW, engine="openpyxl")
+if 'label' not in df_new.columns:
+    df_new['label'] = ""
+if 'add' not in df_new.columns:
+    df_new['add'] = ""
+
+# ---------- 加载句向量模型 ----------
+print("加载句向量模型：", EMBED_MODEL)
+embed_model = SentenceTransformer(EMBED_MODEL)
+questions = df['question'].tolist()
+embeddings = embed_model.encode(questions, show_progress_bar=True)
+embeddings = np.array(embeddings)
+
+# ---------- 初始化标签列（在原始 df 中标注） ----------
+if 'C_label' not in df.columns:
+    df['C_label'] = ""
+# 确保 D_added 在原 df 用于临时存储（最终写回 QUESTION_NEW 的 add 列））
+df['D_added'] = ""
+
+# ---------- 智能等待逻辑 ----------
+def intelligent_wait(base_wait=1.0, rate_limited=False):
+    if rate_limited:
+        wait_time = random.uniform(8, 15)
+        print(f"[限流] 等待 {wait_time:.1f}s ...")
+    else:
+        wait_time = random.uniform(base_wait, base_wait + 2)
+        # 较短的等待以提升速度，但保留随机抖动
+        print(f"[等候] 等待 {wait_time:.1f}s ...")
+    time.sleep(wait_time)
+
+# ---------- 调用 Moonshot（/通用 API）函数，要求返回 JSON 格式 ----------
+def call_moonshot_for_category(category_name, anchor_question, need_count, retries=2):
+    """
+    向 API 提交单个类别请求，要求返回 JSON（结构为 {"category": "<name>", "generated": ["q1","q2",...]}）
+    返回： Python list（生成的问句列表）或 None（失败）
+    """
+    prompt = (
+        "请严格以 JSON 格式返回。要求：\n"
+        "输入包含字段 category（类别名）、anchor（锚点问题），need（需要的同义问句数）。\n"
+        "请为该 anchor 生成 `need` 条与其意思相近但表述不同的中文问句，"
+        "不要包含锚点本身，不要包含原表中已有的完全一致句子（但允许轻微改写）。\n\n"
+        f"示例返回：{{\"category\":\"{category_name}\", \"generated\":[\"问句1\",\"问句2\"]}}\n\n"
+        f"现在请求：{{\"category\":\"{category_name}\", \"anchor\":\"{anchor_question}\", \"need\":{need_count}}}\n"
+        "注意：只输出 JSON，不要有其它前后缀文字。"
+    )
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {API_KEY}"
+    }
+
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": TEMPERATURE,
+        "max_tokens": 1500
+    }
+
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(MOONSHOT_API_URL, headers=headers, json=payload, timeout=API_TIMEOUT)
+            if resp.status_code == 200:
+                # moonshot 的返回可能包在 choices -> message -> content 中，或者直接返回 body
+                try:
+                    body = resp.json()
+                except Exception as e:
+                    # 如果不是 JSON，尝试文本解析
+                    body_text = resp.text.strip()
+                    body = None
+                # 尝试从常见位置提取文本内容
+                content_text = None
+                if isinstance(body, dict):
+                    # 若 API 返回 openai-like 格式
+                    if 'choices' in body and isinstance(body['choices'], list) and body['choices']:
+                        possible = body['choices'][0].get('message') or body['choices'][0]
+                        if isinstance(possible, dict) and 'content' in possible:
+                            content_text = possible['content']
+                        elif isinstance(possible, str):
+                            content_text = possible
+                    elif 'content' in body and isinstance(body['content'], str):
+                        content_text = body['content']
+                    else:
+                        # 如果 body 本身是我们需要的 JSON，就 use it
+                        content_text = json.dumps(body)
+                else:
+                    content_text = resp.text
+
+                # 尝试解析 content_text 为 JSON
+                if not content_text:
+                    print("[警告] 未能解析 API 响应内容")
+                    intelligent_wait(base_wait=2, rate_limited=False)
+                    continue
+
+                # 尝试从 content_text 中提取第一个 JSON 对象
+                parsed = None
+                try:
+                    parsed = json.loads(content_text)
+                except Exception:
+                    # 尝试从文本中提取 JSON 子串（找到第一个 { 开始 和 最后一个 } 结束）
+                    try:
+                        start = content_text.index('{')
+                        end = content_text.rindex('}') + 1
+                        candidate = content_text[start:end]
+                        parsed = json.loads(candidate)
+                    except Exception as e:
+                        parsed = None
+
+                if not parsed:
+                    print(f"[警告] API 返回无法解析为 JSON（尝试 {attempt+1}）：{content_text[:500]}")
+                    intelligent_wait(base_wait=3, rate_limited=False)
+                    continue
+
+                # 期望 parsed 中有 "generated" 字段或类似
+                if isinstance(parsed, dict) and 'generated' in parsed and isinstance(parsed['generated'], list):
+                    return parsed['generated']
+                # 有的实现可能直接返回 category -> list
+                if isinstance(parsed, dict) and category_name in parsed and isinstance(parsed[category_name], list):
+                    return parsed[category_name]
+
+                # 如果 parsed 本身是 list，直接返回
+                if isinstance(parsed, list):
+                    return parsed
+
+                # 如果解析到其它字典结构，尝试寻找首个 list-of-strings
+                for v in parsed.values() if isinstance(parsed, dict) else []:
+                    if isinstance(v, list) and all(isinstance(x, str) for x in v):
+                        return v
+
+                print(f"[警告] API 返回 JSON 但结构不符合预期（尝试 {attempt+1}）：{parsed}")
+                intelligent_wait(base_wait=3, rate_limited=False)
+            elif resp.status_code == 429:
+                print(f"[限流] API 429，文本：{resp.text[:300]}")
+                intelligent_wait(base_wait=8, rate_limited=True)
+            else:
+                print(f"[错误] API 返回状态 {resp.status_code}，文本（前500）：{resp.text[:500]}")
+                intelligent_wait(base_wait=4, rate_limited=False)
+        except Exception as e:
+            print(f"[异常] 调用 API 出错（尝试 {attempt+1}）：{e}")
+            intelligent_wait(base_wait=3, rate_limited=False)
+
+    return None
+
+# ---------- 按类别分组索引 ----------
+category_to_indices = defaultdict(list)
+for idx, cat in enumerate(df['category'].tolist()):
+    category_to_indices[cat].append(idx)
+
+# ---------- 为每个类别做 SAME/DIFFERENT/STANDARD 标注 ----------
+for cat, indices in category_to_indices.items():
+    anchor_idx = indices[0]
+    anchor_emb = embeddings[anchor_idx].reshape(1, -1)
+    class_embs = embeddings[indices]
+    sims = cosine_similarity(anchor_emb, class_embs).flatten()
+    for pos_in_list, sim in enumerate(sims):
+        real_idx = indices[pos_in_list]
+        df.at[real_idx, 'C_label'] = 'SAME' if sim >= SIMILARITY_THRESHOLD else 'DIFFERENT'
+
+# 把每个类别第一个问题标为 STANDARD（锚点）
+for cat, indices in category_to_indices.items():
+    if indices:
+        df.at[indices[0], 'C_label'] = 'STANDARD'
+
+# ---------- 将 C_label 的值复制到新的 label 列（用于最终输出） ----------
+# 确保原始 df 中有 label 列用于存储最终标签
+if 'label' not in df.columns:
+    df['label'] = ""
+# 将 C_label 的值复制到 label 列
+df['label'] = df['C_label']
+
+# ---------- 逐类别检查是否需要生成并调用 API（实时保存进度） ----------
+# 为了更直观显示进度，使用 tqdm
+cats = list(category_to_indices.keys())
+print(f"[开始] 共 {len(cats)} 个类别，开始逐类别补足到 {MIN_SIMILAR_PER_CATEGORY} 条 (STANDARD+SAME) ...")
+
+for cat in tqdm(cats, desc="类别进度"):
+    indices = category_to_indices[cat]
+    # 统计 STANDARD + SAME
+    standard_count = sum(df.loc[indices, 'C_label'] == 'STANDARD')
+    same_count = sum(df.loc[indices, 'C_label'] == 'SAME')
+    have = standard_count + same_count
+    need_total = max(0, MIN_SIMILAR_PER_CATEGORY - have)
+
+    print(f"\n[类别] {cat}：总条数 {len(indices)}，STANDARD {standard_count}，SAME {same_count} -> 需新增 {need_total}")
+
+    if need_total == 0:
+        print(f"[跳过] 类别 {cat} 已满足数量要求（{have}）")
+        continue
+
+    # 锚点（STANDARD）问题与已有问题集合（小写）用于去重判断
+    anchor_idx = indices[0]
+    anchor_q = df.at[anchor_idx, 'question']
+    existing_lower = set([q.lower() for q in df.loc[indices, 'question'].tolist()])
+
+    # 我们向 API 要求 need_total 条。但为保险起见，可以要求 API 多返回一些（本例直接按 need_total 请求）
+    attempts = 0
+    accepted = []
+    while attempts < MAX_CATEGORY_RETRIES and len(accepted) < need_total:
+        attempts += 1
+        print(f"[API] 类别 {cat} 第 {attempts} 次请求，需求 {need_total - len(accepted)} 条...")
+        returned = call_moonshot_for_category(cat, anchor_q, need_total - len(accepted), retries=1)
+        if not returned:
+            print(f"[警告] 类别 {cat} 第 {attempts} 次未收到有效结果，继续重试（若未达上限）。")
+            continue
+
+        # 过滤返回结果：去重、与锚点相同的剔除、相似度检查
+        anchor_emb = embeddings[anchor_idx].reshape(1, -1)
+        for cand in returned:
+            if len(accepted) >= need_total:
+                break
+            cand_str = cand.strip()
+            if cand_str.lower() in existing_lower:
+                # 完全重复，跳过
+                print(f"[过滤] 与已有完全重复，跳过：{cand_str}")
+                continue
+            # 编码并计算与锚点相似度
+            cand_emb = embed_model.encode([cand_str])
+            sim_to_anchor = float(cosine_similarity(anchor_emb, cand_emb.reshape(1, -1)).flatten()[0])
+            if sim_to_anchor >= SIMILARITY_THRESHOLD:
+                accepted.append(cand_str)
+                existing_lower.add(cand_str.lower())
+                print(f"[接收] 接受新问句（sim={sim_to_anchor:.3f}）：{cand_str}")
+            else:
+                print(f"[拒绝] 与锚点相似度太低（{sim_to_anchor:.3f}），跳过：{cand_str}")
+
+        # 若当前 attempts 未满足数量，会在 while 里重试
+        if len(accepted) < need_total:
+            print(f"[进度] 当前已接受 {len(accepted)}/{need_total}，继续尝试（剩余重试 {MAX_CATEGORY_RETRIES - attempts}）")
+            intelligent_wait(base_wait=2, rate_limited=False)
+
+    # 最终检查是否达标
+    if len(accepted) >= need_total:
+        # 将 accepted 写入原始 df 的 D_added（anchor 行），并写入 QUESTION_NEW 的 add 列
+        joined = "\n".join(accepted)
+        df.at[anchor_idx, 'D_added'] = joined
+        # 在 df_new 中找到对应行并写 add 列（匹配 question 文本和 category；若有多行匹配取第一个）
+        mask = (df_new['question'].astype(str).str.strip() == anchor_q.strip())
+        if mask.any():
+            first_idx = mask[mask].index[0]
+            df_new.at[first_idx, 'add'] = joined
+        else:
+            # 若没找到完全匹配，则写入 anchor_idx 相同位置（保守做法）
+            if anchor_idx < len(df_new):
+                df_new.at[anchor_idx, 'add'] = joined
+            else:
+                # 退而求其次，追加到最后一行的 add 列以免丢失
+                df_new.at[len(df_new)-1, 'add'] = joined
+
+        # 实时保存到 QUESTION_NEW（防止中断导致进度丢失）
+        df_new.to_excel(QUESTION_NEW, index=False, engine="openpyxl")
+        print(f"[保存] 类别 {cat} 的新增问句已保存至 {QUESTION_NEW}（add 列）")
+    else:
+        print(f"[失败] 类别 {cat} 未能在 {MAX_CATEGORY_RETRIES} 次尝试内生成足够问句（接受 {len(accepted)}/{need_total}）。")
+        # 将已接受的部分也保存（如果有）
+        if accepted:
+            joined = "\n".join(accepted)
+            df.at[anchor_idx, 'D_added'] = joined
+            mask = (df_new['question'].astype(str).str.strip() == anchor_q.strip())
+            if mask.any():
+                first_idx = mask[mask].index[0]
+                df_new.at[first_idx, 'add'] = joined
+            else:
+                if anchor_idx < len(df_new):
+                    df_new.at[anchor_idx, 'add'] = joined
+                else:
+                    df_new.at[len(df_new)-1, 'add'] = joined
+            df_new.to_excel(QUESTION_NEW, index=False, engine="openpyxl")
+            print(f"[保存] 类别 {cat} 的部分结果已保存（但数量未达标）。")
+
+print("\n[完成] 所有类别处理完毕，最终结果保存在：", QUESTION_NEW)
+
+# ---------- 最终保存：确保 label 列和 add 列都正确写入 ----------
+print("[保存] 正在保存最终结果...")
+
+# 将 label 列从原始 df 复制到 df_new
+for idx in range(min(len(df), len(df_new))):
+    if pd.notna(df.at[idx, 'label']) and df.at[idx, 'label'] != "":
+        df_new.at[idx, 'label'] = df.at[idx, 'label']
+
+# 保存最终文件
+df_new.to_excel(QUESTION_NEW, index=False, engine="openpyxl")
+print(f"[完成] 最终文件已保存：{QUESTION_NEW}")
+print("[信息] 文件包含以下新功能：")
+print("  - label 列：标记原始问题类型（standard/same/different）")
+print("  - add 列：新生成的同义问句（第四列）")
